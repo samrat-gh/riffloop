@@ -17,6 +17,7 @@ export type LooperAction =
   | "pause"
   | "stop"
   | "undo"
+  | "import" // add audio files as layers (the first becomes the loop if none exists)
   | "clear"
   | "inputLost"
   | "fail"
@@ -38,6 +39,7 @@ export function transition(
   switch (state) {
     case "idle":
       if (action === "record") return ctx.countIn > 0 ? "countdown" : "recording";
+      if (action === "import") return "stopped"; // loop is ready; Play starts it
       return null;
     case "countdown":
       if (action === "record" || action === "inputLost") return "idle";
@@ -52,6 +54,7 @@ export function transition(
       if (action === "pause") return "paused";
       if (action === "stop") return "stopped";
       if (action === "undo") return ctx.overdubs > 0 ? "playing" : null;
+      if (action === "import") return "playing";
       if (action === "clear") return "idle";
       return null;
     case "overdubbing":
@@ -62,6 +65,7 @@ export function transition(
       if (action === "play") return "playing";
       if (action === "stop" && state === "paused") return "stopped";
       if (action === "undo") return ctx.overdubs > 0 ? state : null;
+      if (action === "import") return state;
       if (action === "clear") return "idle";
       return null;
     case "error":

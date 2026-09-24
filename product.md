@@ -92,7 +92,7 @@ A small input level meter shows the incoming signal at all times, so the user ca
 
 Guitar input must not be altered by browser voice processing (echo cancellation, noise suppression, auto gain). These are designed for speech and damage guitar tone and sustain.
 
-Headphones are recommended. When using a microphone with speakers, loop playback leaks back into the microphone and gets recorded into overdubs. The UI should mention this briefly, once.
+Headphones are recommended. When using a microphone with speakers, loop playback leaks back into the microphone and gets recorded into overdubs, so layers pile up copies of the earlier audio. The user chooses **Listening on: Headphones / Speakers** (remembered on the device). In Speakers mode, after each overdub RiffLoop removes the loop that leaked from the speakers into the take. It knows exactly what it played, so it can subtract it without touching the guitar. Browser echo cancellation is not used: it is built for voice calls and ducks and chops a guitar while the loop plays. Headphones mode keeps takes exactly as recorded and is the default.
 
 ---
 
@@ -108,7 +108,8 @@ The first recording becomes the **Master Loop**.
 * The choice is shown next to the Record button, can only be changed in Idle, and is remembered on the device.
 * The countdown is shown large on screen, and a short, quiet tick sounds each second, so it can be followed without looking. Recording starts right after the last tick.
 * Pressing Record again during the countdown cancels it and returns to Idle.
-* The count-in applies only to the master recording. Overdubs start immediately, because the playing loop already gives the timing.
+* The same count-in applies to overdubs. The loop stops during it so the ticks are clearly heard, then restarts from the top exactly when recording begins. With a count-in of 0, recording starts at once over the playing loop. Pressing Overdub again during the count-in cancels it: no layer is added and the loop resumes from the top.
+* While recording or overdubbing, the elapsed time is shown.
 
 This also keeps the sound of the key press or click out of the recording.
 
@@ -181,8 +182,9 @@ Overdub behavior, like a physical looper pedal:
 
 * An overdub can start anywhere in the loop, not only at the beginning.
 * Every overdub layer has exactly the master loop length. Recording that passes the loop end wraps around to the loop start.
-* If the overdub continues for several passes, each pass is added on top within the same layer.
-* One overdub (from Overdub pressed to Overdub stopped) creates one layer, which is what Undo removes.
+* An overdub records exactly one loop pass and then ends by itself. The guitarist never has to stop playing to press a button, and the new layer is heard from the very next pass. Pressing Overdub again ends it early.
+* Each overdub creates one layer, which is what Undo removes. To add more, press Overdub again.
+* There is no trimming or cutting of layers. That would turn RiffLoop into an audio editor (see Non-Goals). A layer that went wrong is removed with Undo and played again.
 * Overdubs must line up with what the guitarist heard. Recording and playback latency must be compensated so the layer is not shifted late. This is the final MVP step, done once the core loop works (see `development.md`).
 
 ---
@@ -210,6 +212,45 @@ Overdub 3
 The user does not need to manually align the recordings.
 
 RiffLoop handles synchronization automatically.
+
+---
+
+## 5a. Layer Volume
+
+Each layer has its own volume slider (0–100%, default 100%), shown under the pedal once a loop exists. This is a simple balance control, not a mixer: no pan, EQ, or effects.
+
+While an overdub records, the existing layers are automatically turned down (ducked), so the player hears the new part clearly and less of the loop leaks into a microphone. They return to full level at the loop point where the new layer joins.
+
+---
+
+## 5b. Enhance
+
+A single Enhance switch (Off / On, remembered on the device) polishes the sound for players recording through a microphone:
+
+* Turns down background noise (hiss, fan, room) between notes, and cuts low rumble and hum.
+* Matches the level of every layer, so no layer is much louder than another.
+* Adds light compression and a soft room reverb, so a laptop-mic guitar sounds fuller.
+
+The original takes are always kept. Enhance can be switched off at any time to hear exactly what was recorded. There are no per-effect knobs; RiffLoop is not an effects unit.
+
+---
+
+## 5c. Import and Export
+
+**Import:** audio files (anything the browser can decode, such as WAV, MP3 or M4A) can be added with an Import button or by dropping them anywhere on the page:
+
+* With no loop yet, the first file becomes the loop and sets its length. The loop is then ready to play.
+* Every other file becomes a new layer, fitted to the loop length (cut if longer, padded with silence if shorter). The user is told which files were fitted.
+* Several files are imported in name order, so exported layers come back in their original order.
+* Stereo files are mixed to mono, like recorded layers. Imported layers work like any other layer: volume, Undo, Enhance, export.
+* Import is not possible during a count-in, recording, or overdub.
+
+**Export:** the loop can be saved as audio files:
+
+* **Export mix:** the whole loop as heard (layer volumes, Enhance, reverb), as a stereo WAV exactly one loop long, so it loops seamlessly in any player or DAW.
+* **Layer download:** each layer on its own, as a mono WAV (a stem), at its volume and with Enhance if on. All stems have the loop's length, so they line up when stacked in an audio editor.
+
+Files are 24-bit WAV, named with the date and time so exports don't overwrite each other.
 
 ---
 
@@ -472,14 +513,12 @@ Potential future capabilities include:
 * Tempo control
 * Quantization
 * Tap tempo
-* Import backing tracks
-* Export loops as WAV
 * Save/load sessions
 * Multiple independent loop tracks
 * Redo
 * MIDI foot-controller support
 * Input/output volume controls
-* Basic effects
+* Basic effects (beyond Enhance)
 * Guitar tuner
 
 Future features should not complicate the core looping experience.

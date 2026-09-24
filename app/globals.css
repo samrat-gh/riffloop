@@ -1,11 +1,31 @@
 @import "tailwindcss";
 
+@theme {
+  --color-ground: #0d1618; /* page, behind the pedal */
+  --color-case: #1b2a2e; /* pedal enclosure */
+  --color-case-edge: #2c3f44;
+  --color-window: #081012; /* inset display */
+  --color-silk: #e6dfcb; /* silkscreen print */
+  --color-dim: #8fa0a1;
+  --color-led-off: #25363a;
+  --color-rec: #ff4336;
+  --color-dub: #ffb21e;
+  --color-play: #3fe08a;
+  --font-sans: var(--font-barlow);
+  --font-label: var(--font-barlow-condensed);
+}
+
 :root {
   color-scheme: dark;
 }
 
 body {
-  background: #09090b;
-  color: #f4f4f5;
-  font-family: ui-sans-serif, system-ui, sans-serif;
+  background: var(--color-ground);
+  color: var(--color-silk);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+  }
 }

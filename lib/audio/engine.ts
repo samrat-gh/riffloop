@@ -1,22 +1,43 @@
+import { removeBleed } from "./bleed";
 import { fadeAt, fadeEdges, writeWrapped } from "./buffer";
+import { enhance, roomImpulse } from "./enhance";
 
 const MIN_LOOP_SEC = 0.5;
 const FADE_SEC = 0.005;
 const START_LEAD_SEC = 0.03; // schedule playback slightly ahead so all layers start together
 const FLUSH_MS = 60; // wait for in-flight worklet blocks after a stop press
 const OUTPUT_GAIN = 0.8; // headroom for summed layers
+// ponytail: fixed duck level; make it a setting if players want it louder or quieter.
+const DUCK = 0.45; // existing layers play at this level while an overdub records, so the new part stands out and less loop leaks into a mic
+// Browsers don't report input latency reliably. ponytail: fixed estimate; a per-device calibration setting is the upgrade.
+const INPUT_LATENCY_SEC = 0.01;
+const REVERB_WET = 0.18; // room reverb level when Enhance is on
+const PREVIEW_SEC = 0.15; // schedule the new layer this long before an overdub auto-ends
 
 interface Block {
   frame: number;
   samples: Float32Array;
 }
 
+/** A recorded layer: the raw take, its Enhanced version, and its own volume control. */
+interface Layer {
+  raw: AudioBuffer;
+  enhanced: AudioBuffer;
+  gain: GainNode;
+}
+
 interface Overdub {
   layer: Float32Array<ArrayBuffer>;
+  /** Capture frames [startFrame, endFrame) are shifted by `latency` from the loop positions they belong to. */
   startFrame: number;
   endFrame: number;
+  latency: number;
   firstPos: number | null;
   lastPos: number;
+  written: number; // samples recorded so far, from firstPos around the loop
+  gain: GainNode; // shared by the preview and the finished layer, so a volume set early carries over
+  previewed: boolean;
+  ended: boolean;
 }
 
 export class EngineError extends Error {}
@@ -40,12 +61,14 @@ const mod = (a: number, n: number) => ((a % n) + n) % n;
 export class LoopEngine {
   onInputLost?: () => void;
   onDevicesChanged?: () => void;
+  /** Fired when an overdub reaches one full loop pass; the caller should then call stopOverdub(). */
+  onOverdubEnd?: () => void;
 
   private stream: MediaStream | null = null;
   private source: MediaStreamAudioSourceNode | null = null;
   private readonly meterData: Float32Array<ArrayBuffer>;
 
-  private layers: AudioBuffer[] = [];
+  private layers: Layer[] = [];
   private sources: AudioBufferSourceNode[] = [];
   private loopStart = 0; // audio time at which loop position 0 played
   private offset = 0; // loop position kept while paused/stopped
@@ -55,6 +78,8 @@ export class LoopEngine {
   private masterBlocks: Block[] = [];
   private mode: "none" | "master" | "overdub" = "none";
   private od: Overdub | null = null;
+  private enhanceOn = false;
+  private readonly reverbWet: GainNode;
 
   private constructor(
     private readonly ctx: AudioContext,
@@ -63,12 +88,33 @@ export class LoopEngine {
     private readonly out: GainNode,
   ) {
     this.meterData = new Float32Array(analyser.fftSize);
+
+    // Room reverb send for Enhance, silent until it is turned on.
+    const reverb = ctx.createConvolver();
+    const [left, right] = roomImpulse(ctx.sampleRate);
+    const ir = ctx.createBuffer(2, left.length, ctx.sampleRate);
+    ir.copyToChannel(left, 0);
+    ir.copyToChannel(right, 1);
+    reverb.buffer = ir;
+    this.reverbIr = ir;
+    this.reverbWet = ctx.createGain();
+    this.reverbWet.gain.value = 0;
+    out.connect(reverb).connect(this.reverbWet).connect(ctx.destination);
+
     capture.port.onmessage = (e: MessageEvent<Block>) => this.onBlock(e.data);
     navigator.mediaDevices.addEventListener("devicechange", () => this.onDevicesChanged?.());
   }
 
+  /**
+   * Speakers mode: after each overdub, the loop that leaked from the speakers into the mic is removed
+   * from the take (see bleed.ts). The mic itself is always recorded raw: browser echo cancellation
+   * is built for voice and ducks and chops a guitar while the loop plays.
+   */
+  private speakerMode = false;
+  private reverbIr!: AudioBuffer;
+
   /** Must be called from a user gesture (autoplay rules). */
-  static async create(deviceId?: string): Promise<LoopEngine> {
+  static async create(deviceId?: string, speakerMode = false): Promise<LoopEngine> {
     if (!window.isSecureContext)
       throw new EngineError("RiffLoop needs a secure connection (HTTPS or localhost) to use the microphone.");
     if (!navigator.mediaDevices?.getUserMedia || typeof AudioWorkletNode === "undefined")
@@ -88,6 +134,7 @@ export class LoopEngine {
       out.connect(ctx.destination);
 
       const engine = new LoopEngine(ctx, capture, analyser, out);
+      engine.speakerMode = speakerMode;
       try {
         await engine.openInput(deviceId);
       } catch (e) {
@@ -125,6 +172,11 @@ export class LoopEngine {
     track.addEventListener("ended", () => this.onInputLost?.());
   }
 
+  /** Speakers: remove loop bleed from new overdubs. Headphones: keep takes exactly as recorded. */
+  setSpeakerMode(on: boolean): void {
+    this.speakerMode = on;
+  }
+
   currentDeviceId(): string | undefined {
     return this.stream?.getAudioTracks()[0]?.getSettings().deviceId;
   }
@@ -146,24 +198,47 @@ export class LoopEngine {
 
   /** Starts the count-in (if any), then records from the end of it. */
   startRecording(countIn: number): void {
-    const t0 = this.ctx.currentTime + (countIn > 0 ? 0.05 : 0);
-    for (let i = 0; i < countIn; i++) this.ticks.push(this.tick(t0 + i, i === countIn - 1));
-    this.recStart = t0 + countIn;
+    this.countIn(countIn);
     this.masterBlocks = [];
     this.setCapture("master");
   }
 
+  /** Schedules count-in ticks; the take (master or overdub) starts when they end. */
+  private countIn(seconds: number): void {
+    const t0 = this.ctx.currentTime + (seconds > 0 ? 0.05 : 0);
+    for (let i = 0; i < seconds; i++) this.ticks.push(this.tick(t0 + i, i === seconds - 1));
+    this.recStart = t0 + seconds;
+  }
+
+  /** Seconds left in the count-in of the current take (master or overdub). */
   countdownRemaining(): number {
     return Math.max(0, this.recStart - this.ctx.currentTime);
   }
 
+  /** Seconds recorded so far in the current take (master or overdub). */
   recordingElapsed(): number {
     return Math.max(0, this.ctx.currentTime - this.recStart);
   }
 
-  cancelRecording(): void {
+  /** Round trip in frames: scheduled playback → speakers → player → input → capture. */
+  private latencyFrames(): number {
+    const out = (this.ctx.baseLatency || 0) + (this.ctx.outputLatency || 0); // either can be missing in some browsers
+    return Math.round((out + INPUT_LATENCY_SEC) * this.ctx.sampleRate);
+  }
+
+  private unduck(): void {
+    const g = this.out.gain;
+    g.cancelScheduledValues(this.ctx.currentTime);
+    g.setTargetAtTime(OUTPUT_GAIN, this.ctx.currentTime, 0.02);
+  }
+
+  private stopTicks(): void {
     this.ticks.forEach((t) => t.stop());
     this.ticks = [];
+  }
+
+  cancelRecording(): void {
+    this.stopTicks();
     this.setCapture("none");
   }
 
@@ -187,22 +262,44 @@ export class LoopEngine {
     this.masterBlocks = [];
     fadeEdges(data, Math.round(FADE_SEC * sr));
 
-    this.layers = [this.toBuffer(data)];
+    this.layers = [this.makeLayer(data, this.layerGain())];
     // Loop position 0 is the moment Record was pressed to stop, like a pedal.
-    this.startSources(stopTime);
+    this.startSources(this.layers, stopTime);
     return true;
   }
 
   // ---- overdub ----
 
-  startOverdub(): void {
-    const len = this.layers[0].length;
+  /**
+   * Starts an overdub. With a count-in, the loop stops, the ticks play alone, and the loop restarts
+   * from the top exactly when recording begins. Without one, recording starts at once over the playing loop.
+   * It ends by itself after exactly one loop pass, so the player never has to let go of the guitar.
+   */
+  startOverdub(countIn: number): void {
+    const len = this.layers[0].raw.length;
+    if (countIn > 0) this.stopSources();
+    this.countIn(countIn);
+    if (countIn > 0) this.startSources(this.layers, this.recStart, this.recStart);
+    // Duck the playing layers for exactly the recorded pass, on the audio clock.
+    const g = this.out.gain;
+    g.cancelScheduledValues(this.ctx.currentTime);
+    g.setTargetAtTime(OUTPUT_GAIN * DUCK, this.recStart, 0.03);
+    g.setTargetAtTime(OUTPUT_GAIN, this.recStart + this.loopDuration(), 0.01);
+    // A note played in time with loop position p arrives `latency` frames after p was scheduled,
+    // so capture runs `latency` late and is written `latency` earlier.
+    const latency = this.latencyFrames();
+    const startFrame = Math.round(this.recStart * this.ctx.sampleRate) + latency;
     this.od = {
       layer: new Float32Array(len),
-      startFrame: Math.round(this.ctx.currentTime * this.ctx.sampleRate),
-      endFrame: Infinity,
+      startFrame,
+      endFrame: startFrame + len,
+      latency,
       firstPos: null,
       lastPos: 0,
+      written: 0,
+      gain: this.layerGain(),
+      previewed: false,
+      ended: false,
     };
     this.setCapture("overdub");
   }
@@ -210,18 +307,153 @@ export class LoopEngine {
   async stopOverdub(): Promise<void> {
     const od = this.od;
     if (!od) return;
-    od.endFrame = Math.round(this.ctx.currentTime * this.ctx.sampleRate);
+    this.stopTicks(); // stopping during the count-in cancels it: nothing is written, no layer is added
+    this.unduck();
+    // Cancelled during the count-in: bring the loop back now, from the top.
+    if (this.ctx.currentTime < this.recStart) this.startSources(this.layers, this.ctx.currentTime + START_LEAD_SEC);
+    od.endFrame = Math.min(od.endFrame, Math.round(this.ctx.currentTime * this.ctx.sampleRate) + od.latency);
     await wait(FLUSH_MS);
     this.setCapture("none");
     this.od = null;
-    if (od.firstPos === null) return;
+    if (od.firstPos === null) {
+      od.gain.disconnect();
+      return;
+    }
+
+    let take = od.layer;
+    if (this.speakerMode) {
+      const ref = await this.renderReference();
+      const first = od.firstPos;
+      const count = od.written;
+      take = removeBleed(take, ref, (i) => count >= take.length || mod(i - first, take.length) < count);
+    }
+    if (!this.layers.length) return; // cleared while processing
 
     const n = Math.round(FADE_SEC * this.ctx.sampleRate);
-    fadeAt(od.layer, od.firstPos, n, "in");
-    fadeAt(od.layer, od.lastPos, n, "out");
-    this.layers.push(this.toBuffer(od.layer));
-    // ponytail: the new layer is heard only after the overdub stops; live-updating the buffer is the upgrade for hearing earlier passes while overdubbing.
-    if (this.isPlaying()) this.startSources(this.loopStart);
+    fadeAt(take, od.firstPos, n, "in");
+    fadeAt(take, od.lastPos, n, "out");
+    this.layers.push(this.makeLayer(take, od.gain));
+    // Replaces the preview (if any) with the complete, faded layer. Same content, so the swap is inaudible.
+    // ponytail: in Speakers mode the preview still has bleed, so its first pass is slightly less clean
+    // until this swap; cleaning before the loop point would need the removal to run ahead of time.
+    if (this.isPlaying()) this.startSources(this.layers, this.loopStart);
+  }
+
+  /**
+   * Adds audio files as layers, in name order (so exported layer-1, layer-2… come back in order).
+   * With no loop yet, the first file becomes the loop and sets its length. Every other file is fitted to
+   * the loop length: cut if longer, padded with silence if shorter. Stereo is mixed to mono.
+   * Imports are not faded: files made as loops are usually already seamless.
+   */
+  async importFiles(files: File[]): Promise<{ added: number; fitted: string[] }> {
+    const sorted = [...files].sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+    const decoded: { name: string; data: Float32Array<ArrayBuffer> }[] = [];
+    for (const file of sorted) {
+      let audio: AudioBuffer;
+      try {
+        audio = await this.ctx.decodeAudioData(await file.arrayBuffer());
+      } catch {
+        throw new EngineError(`"${file.name}" could not be read. Use an audio file such as WAV, MP3 or M4A.`);
+      }
+      const mono = new Float32Array(audio.length);
+      for (let c = 0; c < audio.numberOfChannels; c++) {
+        const ch = audio.getChannelData(c);
+        for (let i = 0; i < mono.length; i++) mono[i] += ch[i] / audio.numberOfChannels;
+      }
+      decoded.push({ name: file.name, data: mono });
+    }
+
+    const fitted: string[] = [];
+    const added: Layer[] = [];
+    for (const { name, data } of decoded) {
+      if (!this.layers.length && !added.length) {
+        if (data.length < MIN_LOOP_SEC * this.ctx.sampleRate)
+          throw new EngineError(`"${name}" is too short to be a loop (under ${MIN_LOOP_SEC} s).`);
+        added.push(this.makeLayer(data, this.layerGain()));
+        continue;
+      }
+      const len = (this.layers[0] ?? added[0]).raw.length;
+      if (data.length !== len) fitted.push(name);
+      const fit = new Float32Array(len);
+      fit.set(data.subarray(0, len));
+      added.push(this.makeLayer(fit, this.layerGain()));
+    }
+    this.layers.push(...added);
+    if (this.isPlaying()) this.startSources(this.layers, this.loopStart);
+    return { added: added.length, fitted };
+  }
+
+  /** Exactly what the speakers played during an overdub (ducked), one loop long, for bleed removal. */
+  private async renderReference(): Promise<Float32Array<ArrayBuffer>> {
+    const [mono] = await this.renderLoop(1, OUTPUT_GAIN * DUCK);
+    return mono;
+  }
+
+  /** The whole loop as heard (volumes, Enhance, reverb), stereo, one seamless loop long. For export. */
+  renderMix(): Promise<Float32Array<ArrayBuffer>[]> {
+    return this.renderLoop(2, OUTPUT_GAIN);
+  }
+
+  /** One layer as heard in the mix (Enhance, volume), without reverb, one loop long. For export. */
+  layerAudio(index: number): Float32Array<ArrayBuffer> {
+    const layer = this.layers[index];
+    const data = (this.enhanceOn ? layer.enhanced : layer.raw).getChannelData(0);
+    const gain = layer.gain.gain.value * OUTPUT_GAIN;
+    return data.map((v) => v * gain);
+  }
+
+  sampleRate(): number {
+    return this.ctx.sampleRate;
+  }
+
+  /**
+   * Renders all layers offline, at their volumes, through `gain`, plus the Enhance reverb if on.
+   * Renders two passes and keeps the second, so the reverb tail wraps around the loop like it does live.
+   */
+  private async renderLoop(channels: number, gain: number): Promise<Float32Array<ArrayBuffer>[]> {
+    const len = this.layers[0].raw.length;
+    const off = new OfflineAudioContext(channels, len * 2, this.ctx.sampleRate);
+    const mix = off.createGain();
+    mix.gain.value = gain;
+    mix.connect(off.destination);
+    if (this.enhanceOn) {
+      const reverb = off.createConvolver();
+      reverb.buffer = this.reverbIr;
+      const wet = off.createGain();
+      wet.gain.value = REVERB_WET;
+      mix.connect(reverb).connect(wet).connect(off.destination);
+    }
+    for (const layer of this.layers) {
+      const s = off.createBufferSource();
+      s.buffer = this.enhanceOn ? layer.enhanced : layer.raw;
+      s.loop = true;
+      const g = off.createGain();
+      g.gain.value = layer.gain.gain.value;
+      s.connect(g).connect(mix);
+      s.start(0);
+    }
+    const rendered = await off.startRendering();
+    return Array.from({ length: channels }, (_, c) => rendered.getChannelData(c).slice(len));
+  }
+
+  /** Seconds until the running overdub ends by itself. */
+  overdubRemaining(): number {
+    if (!this.od) return 0;
+    return Math.max(0, (this.od.endFrame - this.od.latency) / this.ctx.sampleRate - this.ctx.currentTime);
+  }
+
+  /**
+   * Just before an overdub auto-ends, schedule the layer recorded so far to start playing exactly
+   * at the loop point, so its first notes are heard on the very next pass. Only the last
+   * PREVIEW_SEC is missing, and that part plays a whole loop later, after stopOverdub has swapped
+   * in the complete layer.
+   */
+  private previewLayer(od: Overdub): void {
+    if (od.firstPos === null) return;
+    const copy = od.layer.slice();
+    fadeAt(copy, od.firstPos, Math.round(FADE_SEC * this.ctx.sampleRate), "in");
+    const loopPoint = (od.endFrame - od.latency) / this.ctx.sampleRate;
+    this.startSources([...this.layers, this.makeLayer(copy, od.gain)], this.loopStart, loopPoint);
   }
 
   /** Every overdub write goes through here. Latency compensation will be applied in this one place. */
@@ -233,20 +465,42 @@ export class LoopEngine {
     }
     if (frame + samples.length > od.endFrame) samples = samples.subarray(0, od.endFrame - frame);
 
-    const pos = frame - Math.round(this.loopStart * this.ctx.sampleRate);
+    const pos = frame - Math.round(this.loopStart * this.ctx.sampleRate) - od.latency; // latency compensation
     od.firstPos ??= mod(pos, od.layer.length);
     writeWrapped(od.layer, samples, pos);
     od.lastPos = mod(pos + samples.length, od.layer.length);
+    od.written += samples.length;
   }
 
   // ---- transport ----
+
+  /** Volume of each layer, 0..1, in recording order (layer 0 is the first loop). */
+  layerVolumes(): number[] {
+    return this.layers.map((l) => l.gain.gain.value);
+  }
+
+  setLayerVolume(index: number, volume: number): void {
+    const layer = this.layers[index];
+    // A short glide avoids zipper noise while dragging.
+    layer?.gain.gain.setTargetAtTime(Math.min(1, Math.max(0, volume)), this.ctx.currentTime, 0.015);
+  }
+
+  /**
+   * Enhance: noise gate, low-cut, compression and level matching per layer (see enhance.ts),
+   * plus a soft room reverb. The raw takes are kept, so this switches back and forth freely.
+   */
+  setEnhance(on: boolean): void {
+    this.enhanceOn = on;
+    this.reverbWet.gain.setTargetAtTime(on ? REVERB_WET : 0, this.ctx.currentTime, 0.05);
+    if (this.isPlaying()) this.startSources(this.layers, this.loopStart);
+  }
 
   layerCount(): number {
     return this.layers.length;
   }
 
   loopDuration(): number {
-    return this.layers[0]?.duration ?? 0;
+    return this.layers[0]?.raw.duration ?? 0;
   }
 
   isPlaying(): boolean {
@@ -257,11 +511,13 @@ export class LoopEngine {
   position(): number {
     const dur = this.loopDuration();
     if (!dur) return 0;
-    return this.isPlaying() ? mod(this.ctx.currentTime - this.loopStart, dur) : this.offset;
+    if (!this.isPlaying()) return this.offset;
+    // Before a scheduled start (e.g. during an overdub count-in) the loop sits at its top.
+    return this.ctx.currentTime < this.loopStart ? 0 : mod(this.ctx.currentTime - this.loopStart, dur);
   }
 
   play(): void {
-    this.startSources(this.ctx.currentTime + START_LEAD_SEC - this.offset);
+    this.startSources(this.layers, this.ctx.currentTime + START_LEAD_SEC - this.offset);
   }
 
   pause(): void {
@@ -276,14 +532,16 @@ export class LoopEngine {
 
   undo(): void {
     if (this.layers.length < 2) return;
-    this.layers.pop();
-    if (this.isPlaying()) this.startSources(this.loopStart);
+    this.layers.pop()?.gain.disconnect();
+    if (this.isPlaying()) this.startSources(this.layers, this.loopStart);
   }
 
   clear(): void {
+    this.unduck();
     this.cancelRecording();
     this.od = null;
     this.stopSources();
+    this.layers.forEach((l) => l.gain.disconnect());
     this.layers = [];
     this.offset = 0;
   }
@@ -295,15 +553,21 @@ export class LoopEngine {
    * loop position 0 falls on `loopStart`. Replaces any running sources at that same instant,
    * so layer changes are seamless.
    */
-  private startSources(loopStart: number): void {
-    const when = this.ctx.currentTime + START_LEAD_SEC;
+  private startSources(
+    layers: Layer[],
+    loopStart: number,
+    when = this.ctx.currentTime + START_LEAD_SEC,
+  ): void {
+    // A time already in the past would start late but keep the old offset, knocking the loop out of alignment.
+    when = Math.max(when, this.ctx.currentTime + 0.005);
     const offset = mod(when - loopStart, this.loopDuration());
     const old = this.sources;
-    this.sources = this.layers.map((buffer) => {
+    this.sources = layers.map(({ raw, enhanced, gain }) => {
+      const buffer = this.enhanceOn ? enhanced : raw;
       const s = this.ctx.createBufferSource();
       s.buffer = buffer;
       s.loop = true;
-      s.connect(this.out);
+      s.connect(gain);
       s.start(when, offset);
       return s;
     });
@@ -323,7 +587,19 @@ export class LoopEngine {
 
   private onBlock({ frame, samples }: Block): void {
     if (this.mode === "overdub" && this.od) {
-      this.writeOverdub(this.od, samples, frame);
+      const od = this.od;
+      this.writeOverdub(od, samples, frame);
+      const reached = frame + samples.length;
+      // Enhance takes ~4 ms per loop second on the main thread, so longer loops need more lead time.
+      const lead = PREVIEW_SEC + this.loopDuration() * 0.008;
+      if (!od.previewed && reached >= od.endFrame - od.latency - lead * this.ctx.sampleRate) {
+        od.previewed = true;
+        this.previewLayer(od);
+      }
+      if (!od.ended && reached >= od.endFrame) {
+        od.ended = true;
+        this.onOverdubEnd?.();
+      }
     } else if (this.mode === "master") {
       const start = Math.round(this.recStart * this.ctx.sampleRate);
       if (frame + samples.length <= start) return; // still counting in
@@ -343,6 +619,16 @@ export class LoopEngine {
     osc.start(when);
     osc.stop(when + 0.06);
     return osc;
+  }
+
+  private layerGain(): GainNode {
+    const gain = this.ctx.createGain();
+    gain.connect(this.out);
+    return gain;
+  }
+
+  private makeLayer(data: Float32Array<ArrayBuffer>, gain: GainNode): Layer {
+    return { raw: this.toBuffer(data), enhanced: this.toBuffer(enhance(data, this.ctx.sampleRate)), gain };
   }
 
   private toBuffer(data: Float32Array<ArrayBuffer>): AudioBuffer {

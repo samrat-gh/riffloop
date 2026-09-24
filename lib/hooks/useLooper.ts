@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { describeError, LoopEngine } from "@/lib/audio/engine";
+import { encodeWav } from "@/lib/audio/wav";
 import { transition, type LooperAction, type LooperState } from "@/lib/looperState";
 import { useFrame } from "./useFrame";
 
 const COUNT_IN_KEY = "riffloop.countIn";
 const DEVICE_KEY = "riffloop.deviceId";
+const SPEAKER_KEY = "riffloop.speakerMode";
+const ENHANCE_KEY = "riffloop.enhance";
 const CLEAR_CONFIRM_MS = 3000;
 
 function load(key: string): string | null {
@@ -23,6 +26,23 @@ function save(key: string, value: string): void {
   }
 }
 
+/** Saves a WAV to the user's downloads. */
+function downloadWav(channels: Float32Array[], sampleRate: number, name: string): void {
+  const url = URL.createObjectURL(new Blob([encodeWav(channels, sampleRate)], { type: "audio/wav" }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 10_000);
+}
+
+/** e.g. "2026-09-24-2130", so exports sort by time and don't overwrite each other. */
+const stamp = () => {
+  const d = new Date();
+  const p = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+};
+
 export function clampCountIn(n: number): number {
   return Number.isFinite(n) ? Math.min(30, Math.max(0, Math.round(n))) : 5;
 }
@@ -32,14 +52,18 @@ export function useLooper() {
   const [state, setState] = useState<LooperState>("idle");
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [layers, setLayers] = useState(0);
+  const [volumes, setVolumes] = useState<number[]>([]); // one per layer
+  const layers = volumes.length;
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
   const [deviceId, setDeviceId] = useState<string | undefined>(() => load(DEVICE_KEY) ?? undefined);
   const [countIn, setCountInState] = useState(() => clampCountIn(Number(load(COUNT_IN_KEY) ?? 5)));
+  const [speakerMode, setSpeakerModeState] = useState(() => load(SPEAKER_KEY) === "1");
+  const [enhance, setEnhanceState] = useState(() => load(ENHANCE_KEY) === "1");
   const [confirmClear, setConfirmClear] = useState(false);
   const [starting, setStarting] = useState(false);
   const busy = useRef(false);
   const onInputLost = useRef<() => void>(() => {});
+  const onOverdubEnd = useRef<() => void>(() => {});
 
   const overdubs = Math.max(0, layers - 1);
   const can = useCallback(
@@ -56,8 +80,10 @@ export function useLooper() {
     setStarting(true);
     setError(null);
     try {
-      const e = await LoopEngine.create(load(DEVICE_KEY) ?? undefined);
+      const e = await LoopEngine.create(load(DEVICE_KEY) ?? undefined, load(SPEAKER_KEY) === "1");
       e.onInputLost = () => onInputLost.current();
+      e.onOverdubEnd = () => onOverdubEnd.current();
+      e.setEnhance(load(ENHANCE_KEY) === "1");
       e.onDevicesChanged = () => void refreshDevices(e);
       setEngine(e);
       setState("idle");
@@ -92,7 +118,7 @@ export function useLooper() {
     } else if (state === "recording") {
       void once(async () => {
         const ok = await engine.stopRecording();
-        setLayers(engine.layerCount());
+        setVolumes(engine.layerVolumes());
         setState(ok ? "playing" : "idle");
       });
     }
@@ -101,16 +127,16 @@ export function useLooper() {
   const overdub = useCallback(() => {
     if (!engine || !can("overdub")) return;
     if (state === "playing") {
-      engine.startOverdub();
+      engine.startOverdub(countIn);
       setState("overdubbing");
     } else {
       void once(async () => {
         await engine.stopOverdub();
-        setLayers(engine.layerCount());
+        setVolumes(engine.layerVolumes());
         setState("playing");
       });
     }
-  }, [engine, can, state, once]);
+  }, [engine, can, state, countIn, once]);
 
   const play = useCallback(() => {
     if (!engine || !can("play")) return;
@@ -133,7 +159,7 @@ export function useLooper() {
   const undo = useCallback(() => {
     if (!engine || !can("undo")) return;
     engine.undo();
-    setLayers(engine.layerCount());
+    setVolumes(engine.layerVolumes());
   }, [engine, can]);
 
   const clear = useCallback(() => {
@@ -143,7 +169,7 @@ export function useLooper() {
       return;
     }
     engine.clear();
-    setLayers(0);
+    setVolumes([]);
     setConfirmClear(false);
     setState("idle");
   }, [engine, can, confirmClear]);
@@ -175,6 +201,85 @@ export function useLooper() {
     [engine, refreshDevices],
   );
 
+  const setSpeakerMode = useCallback(
+    (on: boolean) => {
+      engine?.setSpeakerMode(on);
+      setSpeakerModeState(on);
+      save(SPEAKER_KEY, on ? "1" : "0");
+    },
+    [engine],
+  );
+
+  const setEnhance = useCallback(
+    (on: boolean) => {
+      engine?.setEnhance(on);
+      setEnhanceState(on);
+      save(ENHANCE_KEY, on ? "1" : "0");
+    },
+    [engine],
+  );
+
+  const [exporting, setExporting] = useState(false);
+
+  /** The full loop as heard, stereo, one seamless loop long. */
+  const exportMix = useCallback(async () => {
+    if (!engine || !engine.layerCount() || exporting) return;
+    setExporting(true);
+    try {
+      downloadWav(await engine.renderMix(), engine.sampleRate(), `riffloop-mix-${stamp()}.wav`);
+    } catch (err) {
+      setNotice(`Export failed: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setExporting(false);
+    }
+  }, [engine, exporting]);
+
+  /** One layer on its own (a stem). All stems have the loop's length and line up when stacked. */
+  const exportLayer = useCallback(
+    (index: number) => {
+      if (!engine || index >= engine.layerCount()) return;
+      downloadWav([engine.layerAudio(index)], engine.sampleRate(), `riffloop-layer-${index + 1}-${stamp()}.wav`);
+    },
+    [engine],
+  );
+
+  const [importing, setImporting] = useState(false);
+
+  /** Adds audio files as layers; with no loop yet, the first file becomes the loop. */
+  const importFiles = useCallback(
+    async (files: File[]) => {
+      if (!engine || !files.length || importing) return;
+      if (!can("import")) {
+        setNotice("Finish the current recording before importing.");
+        return;
+      }
+      setImporting(true);
+      try {
+        const { fitted } = await engine.importFiles(files);
+        setVolumes(engine.layerVolumes());
+        if (state === "idle") setState("stopped");
+        setNotice(
+          fitted.length
+            ? `Fitted to the loop length (cut or padded with silence): ${fitted.join(", ")}`
+            : null,
+        );
+      } catch (err) {
+        setNotice(describeError(err));
+      } finally {
+        setImporting(false);
+      }
+    },
+    [engine, importing, can, state],
+  );
+
+  const setVolume = useCallback(
+    (index: number, volume: number) => {
+      engine?.setLayerVolume(index, volume);
+      setVolumes((v) => v.map((old, i) => (i === index ? volume : old)));
+    },
+    [engine],
+  );
+
   // Countdown finishes on the audio clock; the UI follows.
   useFrame(() => {
     if (engine && engine.countdownRemaining() <= 0) setState("recording");
@@ -187,6 +292,9 @@ export function useLooper() {
       if (state === "countdown" || state === "recording") record();
       else if (state === "overdubbing") overdub();
     };
+    onOverdubEnd.current = () => {
+      if (state === "overdubbing") overdub();
+    };
   });
 
   return {
@@ -195,6 +303,13 @@ export function useLooper() {
     error,
     notice,
     layers,
+    volumes,
+    setVolume,
+    exporting,
+    importing,
+    importFiles,
+    exportMix,
+    exportLayer,
     devices,
     deviceId,
     countIn,
@@ -211,6 +326,10 @@ export function useLooper() {
     clear,
     setCountIn,
     selectInput,
+    speakerMode,
+    enhance,
+    setEnhance,
+    setSpeakerMode,
     dismissNotice: () => setNotice(null),
   };
 }
