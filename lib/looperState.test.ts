@@ -54,6 +54,15 @@ describe("transition", () => {
     expect(transition("playing", "inputLost", ctx)).toBeNull();
   });
 
+  it("imports into a new or existing loop, never during a take", () => {
+    expect(transition("idle", "import", ctx)).toBe("stopped");
+    expect(transition("playing", "import", ctx)).toBe("playing");
+    expect(transition("paused", "import", ctx)).toBe("paused");
+    expect(transition("recording", "import", ctx)).toBeNull();
+    expect(transition("overdubbing", "import", ctx)).toBeNull();
+    expect(transition("countdown", "import", ctx)).toBeNull();
+  });
+
   it("enters and leaves the error state", () => {
     expect(transition("playing", "fail", ctx)).toBe("error");
     expect(transition("error", "play", ctx)).toBeNull();

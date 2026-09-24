@@ -215,6 +215,8 @@ An overdub auto-ends after exactly one loop length of recording (`endFrame = sta
 
 Each layer plays through its own `GainNode` (layer volume) into one output `GainNode`. Ducking during an overdub is scheduled on the output gain on the audio clock: down at the take start, back up at the loop point where the take ends. Cancelling or stopping early restores it immediately.
 
+**Enhance** (switchable, `lib/audio/enhance.ts`): every layer is stored twice, raw and enhanced. The enhanced copy goes through a chain: 80 Hz high-pass; gentle noise gate (opens 10 dB above the take's noise floor, capped at -40 dBFS; closes 6 dB lower after a 100 ms hold; fades down ~150 ms to -12 dB; digital silence is ignored when measuring the floor); level match; 2:1 RMS compressor (30 ms attack, 400 ms release) that only touches loud strums; level match again (-20 dBFS RMS, peaks ≤ -1 dBFS). A unit test fails if the level ever drops faster than 1.5 dB per 20 ms, which guards against pumping and chopping. It is done offline in plain JS with no lookahead, so timing never shifts. Each stage runs twice around the loop so filter and envelope state wrap across the loop point. A convolver room reverb (generated impulse) is sent from the output bus. Turning Enhance on or off swaps buffers at a scheduled instant, and the raw takes are never modified.
+
 Summing many layers can clip. Leave headroom on the output mix instead of adding a compressor or limiter that changes the guitar sound.
 
 Undo removes only the most recent overdub.
@@ -282,7 +284,15 @@ Input level meter:
 * Show a clip warning when the peak is at or near 1.0 (0 dBFS).
 * The meter keeps working in every state, including idle, so the user can check the input before recording.
 
-Exception: in Speakers mode, the input is opened with `echoCancellation: true` (noise suppression and auto gain stay off). The browser then cancels the page's own output from the input, which stops the loop from bleeding into overdubs through the microphone. Switching modes reopens the current input.
+Never use browser echo cancellation, even for speakers: it is designed for voice calls, and while the loop plays it ducks and chops the guitar, which degraded every overdub layer. Instead, Speakers mode removes bleed offline after each overdub (`lib/audio/bleed.ts`):
+
+1. Render exactly what the speakers played during the take with an `OfflineAudioContext`: every layer at its volume, ducked, plus the Enhance reverb, over two passes so the reverb wraps around the loop.
+2. Compute exact circular cross- and auto-correlations between the take and that reference with one large FFT.
+3. Find where the bleed arrives: the cross-correlation peak, searched from -5 ms to +43 ms around the latency-compensated position.
+4. Fit a short 8 ms filter (the speaker→mic path) there by least squares, solved with Levinson recursion. Keeping it short matters, because the guitar leaks into the fit in proportion to √(taps / loop length).
+5. Subtract the filtered reference from the recorded part of the take.
+
+On test signals, this removes about 22 dB of bleed on a 4 s loop, with 99.6% of the guitar kept, and more on longer loops. It is linear, so it never gates or ducks the guitar.
 
 Do not play the live input to the output (software monitoring) by default. It adds latency, and with a microphone it causes feedback. Microphone users hear the acoustic sound directly, and interface users normally monitor through the interface itself.
 

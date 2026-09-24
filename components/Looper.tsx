@@ -272,14 +272,51 @@ function useKeyboard(l: LooperApi) {
   }, []);
 }
 
-/** One volume slider per layer. Layer 1 is the first loop. */
+const panelBtn =
+  "rounded-xl border border-case-edge bg-case px-3 py-1.5 font-label text-base font-semibold text-silk hover:border-dim focus-visible:outline-2 focus-visible:outline-silk disabled:opacity-50";
+
+/** One row per layer: volume, and a download of that layer on its own. Plus import and the whole mix. */
 function LayerMixer({ l }: { l: LooperApi }) {
-  if (l.layers === 0) return null;
+  const fileInput = useRef<HTMLInputElement>(null);
   return (
     <div className="flex flex-col gap-3">
-      <span className="font-label text-base font-medium text-dim">Layer volume</span>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <span className="font-label text-base font-medium text-dim">Layers</span>
+        <div className="flex gap-2">
+          <button
+            type="button"
+            onClick={() => fileInput.current?.click()}
+            disabled={l.importing || !l.can("import")}
+            className={panelBtn}
+          >
+            {l.importing ? "Importing…" : "Import audio"}
+          </button>
+          {l.layers > 0 && (
+            <button type="button" onClick={() => void l.exportMix()} disabled={l.exporting} className={panelBtn}>
+              {l.exporting ? "Exporting…" : "Export mix (WAV)"}
+            </button>
+          )}
+        </div>
+        <input
+          ref={fileInput}
+          type="file"
+          accept="audio/*"
+          multiple
+          hidden
+          onChange={(ev) => {
+            void l.importFiles([...(ev.target.files ?? [])]);
+            ev.target.value = ""; // allow importing the same file again
+          }}
+        />
+      </div>
+      {l.layers === 0 && (
+        <p className="text-sm text-dim">
+          Import an audio file to use it as your loop, or drop files anywhere on the page. You can also add files to an
+          existing loop as extra layers.
+        </p>
+      )}
       {l.volumes.map((v, i) => (
-        <label key={i} className="grid grid-cols-[4.5rem_1fr_3rem] items-center gap-3">
+        <div key={i} className="grid grid-cols-[4.5rem_1fr_3rem_auto] items-center gap-3">
           <span className="font-label text-base font-semibold">Layer {i + 1}</span>
           <input
             type="range"
@@ -292,9 +329,55 @@ function LayerMixer({ l }: { l: LooperApi }) {
             className="w-full accent-silk"
           />
           <span className="text-right font-label text-base tabular-nums text-dim">{Math.round(v * 100)}%</span>
-        </label>
+          <button
+            type="button"
+            onClick={() => l.exportLayer(i)}
+            aria-label={`Download layer ${i + 1} as WAV`}
+            title={`Download layer ${i + 1}`}
+            className="rounded-lg px-2 py-1 font-label text-sm font-semibold text-dim hover:text-silk focus-visible:outline-2 focus-visible:outline-silk"
+          >
+            WAV ↓
+          </button>
+        </div>
       ))}
-      <p className="text-sm text-dim">While you overdub, the other layers play quieter so you can hear yourself.</p>
+      <p className="text-sm text-dim">
+        While you overdub, the other layers play quieter so you can hear yourself. Layer downloads all have the
+        loop&apos;s length, so they line up when stacked in any audio editor.
+      </p>
+    </div>
+  );
+}
+
+/** Enhance on/off. Works on the stored raw takes, so it can be flipped any time outside a take. */
+function EnhanceSelect({ l }: { l: LooperApi }) {
+  const busy = l.state === "countdown" || l.state === "recording" || l.state === "overdubbing";
+  const option = (on: boolean, label: string) => (
+    <button
+      type="button"
+      disabled={busy}
+      aria-pressed={l.enhance === on}
+      onClick={() => l.setEnhance(on)}
+      className={`rounded-lg px-3 py-1.5 font-label text-base font-semibold transition-colors focus-visible:outline-2 focus-visible:outline-silk disabled:opacity-40 ${
+        l.enhance === on ? "bg-silk text-case" : "text-dim hover:text-silk"
+      }`}
+    >
+      {label}
+    </button>
+  );
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex flex-wrap items-center gap-3">
+        <span className="font-label text-base font-medium text-dim">Enhance</span>
+        <div className="flex rounded-xl bg-window p-1" role="group" aria-label="Enhance">
+          {option(false, "Off")}
+          {option(true, "On")}
+        </div>
+      </div>
+      <p className="text-sm text-dim">
+        {l.enhance
+          ? "Background noise turned down, layers matched in level, light compression and room reverb. Your original takes are kept."
+          : "You hear exactly what was recorded. Turn on to reduce background noise and polish the sound."}
+      </p>
     </div>
   );
 }
@@ -307,7 +390,7 @@ function MonitorSelect({ l }: { l: LooperApi }) {
       type="button"
       disabled={busy}
       aria-pressed={l.speakerMode === on}
-      onClick={() => void l.setSpeakerMode(on)}
+      onClick={() => l.setSpeakerMode(on)}
       className={`rounded-lg px-3 py-1.5 font-label text-base font-semibold transition-colors focus-visible:outline-2 focus-visible:outline-silk disabled:opacity-40 ${
         l.speakerMode === on ? "bg-silk text-case" : "text-dim hover:text-silk"
       }`}
@@ -326,8 +409,8 @@ function MonitorSelect({ l }: { l: LooperApi }) {
       </div>
       <p className="text-sm text-dim">
         {l.speakerMode
-          ? "Echo cancellation is on, so the loop from your speakers stays out of new layers. Headphones give a cleaner sound."
-          : "Best sound. If you hear the loop from speakers, switch to Speakers, or the loop gets recorded into your overdubs."}
+          ? "After each overdub, the loop that leaked from your speakers into the mic is removed from the new layer. Headphones are still the cleanest."
+          : "Takes are kept exactly as recorded. If you hear the loop from speakers, switch to Speakers so it doesn't pile up in your overdubs."}
       </p>
     </div>
   );
@@ -341,9 +424,34 @@ function Pedal({ children }: { children: ReactNode }) {
   );
 }
 
+/** Dropping audio files anywhere on the page imports them as layers. */
+function useFileDrop(l: LooperApi) {
+  const ref = useRef(l);
+  useEffect(() => {
+    ref.current = l;
+  });
+  useEffect(() => {
+    const over = (ev: DragEvent) => {
+      if (ev.dataTransfer?.types.includes("Files")) ev.preventDefault();
+    };
+    const drop = (ev: DragEvent) => {
+      if (!ev.dataTransfer?.files.length) return;
+      ev.preventDefault();
+      void ref.current.importFiles([...ev.dataTransfer.files]);
+    };
+    window.addEventListener("dragover", over);
+    window.addEventListener("drop", drop);
+    return () => {
+      window.removeEventListener("dragover", over);
+      window.removeEventListener("drop", drop);
+    };
+  }, []);
+}
+
 export default function Looper() {
   const l = useLooper();
   useKeyboard(l);
+  useFileDrop(l);
 
   const wordmark = <h1 className="font-label text-2xl font-bold italic tracking-tight">RiffLoop</h1>;
 
@@ -392,6 +500,7 @@ export default function Looper() {
         <SecondaryControls l={l} />
       </Pedal>
       <div className="flex flex-col gap-4 px-1">
+        <EnhanceSelect l={l} />
         <LayerMixer l={l} />
         <CountInSelect l={l} />
         <MonitorSelect l={l} />
