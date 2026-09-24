@@ -5,6 +5,7 @@ import { useFrame } from "./useFrame";
 
 const COUNT_IN_KEY = "riffloop.countIn";
 const DEVICE_KEY = "riffloop.deviceId";
+const SPEAKER_KEY = "riffloop.speakerMode";
 const CLEAR_CONFIRM_MS = 3000;
 
 function load(key: string): string | null {
@@ -32,14 +33,17 @@ export function useLooper() {
   const [state, setState] = useState<LooperState>("idle");
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [layers, setLayers] = useState(0);
+  const [volumes, setVolumes] = useState<number[]>([]); // one per layer
+  const layers = volumes.length;
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
   const [deviceId, setDeviceId] = useState<string | undefined>(() => load(DEVICE_KEY) ?? undefined);
   const [countIn, setCountInState] = useState(() => clampCountIn(Number(load(COUNT_IN_KEY) ?? 5)));
+  const [speakerMode, setSpeakerModeState] = useState(() => load(SPEAKER_KEY) === "1");
   const [confirmClear, setConfirmClear] = useState(false);
   const [starting, setStarting] = useState(false);
   const busy = useRef(false);
   const onInputLost = useRef<() => void>(() => {});
+  const onOverdubEnd = useRef<() => void>(() => {});
 
   const overdubs = Math.max(0, layers - 1);
   const can = useCallback(
@@ -56,8 +60,9 @@ export function useLooper() {
     setStarting(true);
     setError(null);
     try {
-      const e = await LoopEngine.create(load(DEVICE_KEY) ?? undefined);
+      const e = await LoopEngine.create(load(DEVICE_KEY) ?? undefined, load(SPEAKER_KEY) === "1");
       e.onInputLost = () => onInputLost.current();
+      e.onOverdubEnd = () => onOverdubEnd.current();
       e.onDevicesChanged = () => void refreshDevices(e);
       setEngine(e);
       setState("idle");
@@ -92,7 +97,7 @@ export function useLooper() {
     } else if (state === "recording") {
       void once(async () => {
         const ok = await engine.stopRecording();
-        setLayers(engine.layerCount());
+        setVolumes(engine.layerVolumes());
         setState(ok ? "playing" : "idle");
       });
     }
@@ -101,16 +106,16 @@ export function useLooper() {
   const overdub = useCallback(() => {
     if (!engine || !can("overdub")) return;
     if (state === "playing") {
-      engine.startOverdub();
+      engine.startOverdub(countIn);
       setState("overdubbing");
     } else {
       void once(async () => {
         await engine.stopOverdub();
-        setLayers(engine.layerCount());
+        setVolumes(engine.layerVolumes());
         setState("playing");
       });
     }
-  }, [engine, can, state, once]);
+  }, [engine, can, state, countIn, once]);
 
   const play = useCallback(() => {
     if (!engine || !can("play")) return;
@@ -133,7 +138,7 @@ export function useLooper() {
   const undo = useCallback(() => {
     if (!engine || !can("undo")) return;
     engine.undo();
-    setLayers(engine.layerCount());
+    setVolumes(engine.layerVolumes());
   }, [engine, can]);
 
   const clear = useCallback(() => {
@@ -143,7 +148,7 @@ export function useLooper() {
       return;
     }
     engine.clear();
-    setLayers(0);
+    setVolumes([]);
     setConfirmClear(false);
     setState("idle");
   }, [engine, can, confirmClear]);
@@ -175,6 +180,28 @@ export function useLooper() {
     [engine, refreshDevices],
   );
 
+  const setSpeakerMode = useCallback(
+    async (on: boolean) => {
+      if (!engine) return;
+      try {
+        await engine.setSpeakerMode(on);
+        setSpeakerModeState(on);
+        save(SPEAKER_KEY, on ? "1" : "0");
+      } catch (err) {
+        setNotice(describeError(err));
+      }
+    },
+    [engine],
+  );
+
+  const setVolume = useCallback(
+    (index: number, volume: number) => {
+      engine?.setLayerVolume(index, volume);
+      setVolumes((v) => v.map((old, i) => (i === index ? volume : old)));
+    },
+    [engine],
+  );
+
   // Countdown finishes on the audio clock; the UI follows.
   useFrame(() => {
     if (engine && engine.countdownRemaining() <= 0) setState("recording");
@@ -187,6 +214,9 @@ export function useLooper() {
       if (state === "countdown" || state === "recording") record();
       else if (state === "overdubbing") overdub();
     };
+    onOverdubEnd.current = () => {
+      if (state === "overdubbing") overdub();
+    };
   });
 
   return {
@@ -195,6 +225,8 @@ export function useLooper() {
     error,
     notice,
     layers,
+    volumes,
+    setVolume,
     devices,
     deviceId,
     countIn,
@@ -211,6 +243,8 @@ export function useLooper() {
     clear,
     setCountIn,
     selectInput,
+    speakerMode,
+    setSpeakerMode,
     dismissNotice: () => setNotice(null),
   };
 }
